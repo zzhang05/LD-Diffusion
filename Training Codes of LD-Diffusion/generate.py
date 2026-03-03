@@ -51,6 +51,7 @@ def edm_sampler(
     net, latents, latents_pos, mask_pos, class_labels=None, randn_like=torch.randn_like,
     num_steps=18, sigma_min=0.002, sigma_max=80, rho=7,
     S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
+    img_vae=None, latent_scale_factor=0.18215, sigma_switch=None,
 ):
     # img_channel = latents.shape[1]
     # Adjust noise levels based on what's supported by the network.
@@ -62,9 +63,25 @@ def edm_sampler(
     t_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
     t_steps = torch.cat([net.round_sigma(t_steps), torch.zeros_like(t_steps[:1])]) # t_N = 0
 
-    # Main sampling loop.
+    def denoise_latent(x, t):
+        if mask_pos:
+            return net(x, t, class_labels).to(torch.float64)
+        return net(x, t, latents_pos, class_labels).to(torch.float64)
+
+    def denoise_pixel(x_pixel, t):
+        x_latent = img_vae.encode(x_pixel.float())['latent_dist'].sample() * latent_scale_factor
+        denoised_latent = denoise_latent(x_latent.to(torch.float64), t)
+        denoised_pixel = img_vae.decode((denoised_latent / latent_scale_factor).float()).sample
+        return denoised_pixel.to(torch.float64)
+
+    # Main sampling loop with sigma-based latent->pixel switch.
     x_next = latents.to(torch.float64) * t_steps[0]
+    in_pixel_space = False
     for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])): # 0, ..., N-1
+        if (not in_pixel_space) and (sigma_switch is not None) and (img_vae is not None) and (t_cur <= sigma_switch):
+            x_next = img_vae.decode((x_next / latent_scale_factor).float()).sample.to(torch.float64)
+            in_pixel_space = True
+
         x_cur = x_next
 
         # Increase noise temporarily.
@@ -72,30 +89,17 @@ def edm_sampler(
         t_hat = net.round_sigma(t_cur + gamma * t_cur)
         x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * randn_like(x_cur)
 
-        # Euler step.
-        if mask_pos:
-            denoised = net(x_hat, t_hat, class_labels).to(torch.float64)
-        else:
-            # x_hat_w_pos = torch.cat([x_hat, latents_pos], dim=1)
-            denoised = net(x_hat, t_hat, latents_pos, class_labels).to(torch.float64)
-            # denoised = denoised[:, :img_channel]
-
+        denoised = denoise_pixel(x_hat, t_hat) if in_pixel_space else denoise_latent(x_hat, t_hat)
         d_cur = (x_hat - denoised) / t_hat
         x_next = x_hat + (t_next - t_hat) * d_cur
 
         # Apply 2nd order correction.
         if i < num_steps - 1:
-            if mask_pos:
-                denoised = net(x_next, t_next, class_labels).to(torch.float64)
-            else:
-                # x_next_w_pos = torch.cat([x_next, latents_pos], dim=1)
-                denoised = net(x_next, t_next, latents_pos, class_labels).to(torch.float64)
-                # denoised = denoised[:, :img_channel]
-
+            denoised = denoise_pixel(x_next, t_next) if in_pixel_space else denoise_latent(x_next, t_next)
             d_prime = (x_next - denoised) / t_next
             x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
 
-    return x_next
+    return x_next, in_pixel_space
 
 #----------------------------------------------------------------------------
 # Generalized ablation sampler, representing the superset of all sampling
@@ -264,6 +268,7 @@ def set_requires_grad(model, value):
 @click.option('--embed_fq',                help='Positional embedding frequency', metavar='INT',                    type=int, default=0)
 @click.option('--mask_pos',                help='Mask out pos channels', metavar='BOOL',                            type=bool, default=False, show_default=True)
 @click.option('--on_latents',              help='Generate with latent vae', metavar='BOOL',                            type=bool, default=False, show_default=True)
+@click.option('--sigma_switch',            help='Noise threshold to switch latent sampler to pixel sampler', metavar='FLOAT',            type=click.FloatRange(min=0), default=None)
 @click.option('--outdir',                  help='Where to save the output images', metavar='DIR',                   type=str, required=True)
 
 # patch options
@@ -290,7 +295,7 @@ def set_requires_grad(model, value):
 @click.option('--schedule',                help='Ablate noise schedule sigma(t)', metavar='vp|ve|linear',           type=click.Choice(['vp', 've', 'linear']))
 @click.option('--scaling',                 help='Ablate signal scaling s(t)', metavar='vp|none',                    type=click.Choice(['vp', 'none']))
 
-def main(network_pkl, resolution, on_latents, embed_fq, mask_pos, x_start, y_start, image_size, outdir, subdirs, seeds, class_idx, max_batch_size, device=torch.device('cuda'), **sampler_kwargs):
+def main(network_pkl, resolution, on_latents, sigma_switch, embed_fq, mask_pos, x_start, y_start, image_size, outdir, subdirs, seeds, class_idx, max_batch_size, device=torch.device('cuda'), **sampler_kwargs):
     """Generate random images using the techniques described in the paper
     "Elucidating the Design Space of Diffusion-Based Generative Models".
 
@@ -374,9 +379,15 @@ def main(network_pkl, resolution, on_latents, embed_fq, mask_pos, x_start, y_sta
         sampler_kwargs = {key: value for key, value in sampler_kwargs.items() if value is not None}
         have_ablation_kwargs = any(x in sampler_kwargs for x in ['solver', 'discretization', 'schedule', 'scaling'])
         sampler_fn = ablation_sampler if have_ablation_kwargs else edm_sampler
-        images = sampler_fn(net, latents, latents_pos, mask_pos, class_labels, randn_like=rnd.randn_like, **sampler_kwargs)
+        if sampler_fn is edm_sampler:
+            images, already_pixel = sampler_fn(net, latents, latents_pos, mask_pos, class_labels, randn_like=rnd.randn_like,
+                                               img_vae=img_vae if on_latents else None, latent_scale_factor=latent_scale_factor if on_latents else 0.18215,
+                                               sigma_switch=sigma_switch, **sampler_kwargs)
+        else:
+            images = sampler_fn(net, latents, class_labels=class_labels, randn_like=rnd.randn_like, **sampler_kwargs)
+            already_pixel = False
 
-        if on_latents:
+        if on_latents and not already_pixel:
             images = 1 / 0.18215 * images
             images = img_vae.decode(images.float()).sample
 

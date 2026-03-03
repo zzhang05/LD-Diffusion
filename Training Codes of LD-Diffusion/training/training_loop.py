@@ -54,6 +54,8 @@ def training_loop(
     real_p              = 0.5,
     train_on_latents    = False,
     progressive         = False,
+    e2e_pixel_l2        = False,
+    sigma_switch        = 0.5,
     device              = torch.device('cuda'),
 ):
     # Initialize.
@@ -79,15 +81,20 @@ def training_loop(
     dataset_iterator = iter(torch.utils.data.DataLoader(dataset=dataset_obj, sampler=dataset_sampler, batch_size=batch_gpu, **data_loader_kwargs))
 
     img_resolution, img_channels = dataset_obj.resolution, dataset_obj.num_channels
+    latent_scale_factor = None
 
     if train_on_latents:
         # img_vae = AutoencoderKL.from_pretrained("stabilityai/stable-diffusion-2", subfolder="vae").to(device)
         #img_vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-ema").to(device)
         img_vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to(device)
         img_vae.eval()
-        set_requires_grad(img_vae, False)
         latent_scale_factor = 0.18215
         img_resolution, img_channels = dataset_obj.resolution // 8, 4
+        if e2e_pixel_l2:
+            set_requires_grad(img_vae, True)
+            img_vae.train()
+        else:
+            set_requires_grad(img_vae, False)
     else:
         img_vae = None
 
@@ -111,7 +118,10 @@ def training_loop(
     # Setup optimizer.
     dist.print0('Setting up optimizer...')
     loss_fn = dnnlib.util.construct_class_by_name(**loss_kwargs) # training.loss.(VP|VE|EDM)Loss
-    optimizer = dnnlib.util.construct_class_by_name(params=net.parameters(), **optimizer_kwargs) # subclass of torch.optim.Optimizer
+    opt_params = list(net.parameters())
+    if e2e_pixel_l2 and img_vae is not None:
+        opt_params += list(img_vae.parameters())
+    optimizer = dnnlib.util.construct_class_by_name(params=opt_params, **optimizer_kwargs) # subclass of torch.optim.Optimizer
     augment_pipe = dnnlib.util.construct_class_by_name(**augment_kwargs) if augment_kwargs is not None else None # training.augment.AugmentPipe
     ddp = torch.nn.parallel.DistributedDataParallel(net, device_ids=[device], broadcast_buffers=False)
     ema = copy.deepcopy(net).eval().requires_grad_(False)
@@ -177,15 +187,23 @@ def training_loop(
                 images, labels = torch.cat(images, dim=0), torch.cat(labels, dim=0)
                 del images_, labels_
                 images = images.to(device).to(torch.float32) / 127.5 - 1
+                images_pixels = images
 
                 if train_on_latents:
-                    with torch.no_grad():
-                        images = img_vae.encode(images)['latent_dist'].sample()
+                    if e2e_pixel_l2:
+                        images = img_vae.encode(images_pixels)['latent_dist'].sample()
                         images = latent_scale_factor * images
+                    else:
+                        with torch.no_grad():
+                            images = img_vae.encode(images_pixels)['latent_dist'].sample()
+                            images = latent_scale_factor * images
 
                 labels = labels.to(device)
                 loss = loss_fn(net=ddp, images=images, patch_size=patch_size, resolution=img_resolution,
-                               labels=labels, augment_pipe=augment_pipe)
+                               labels=labels, augment_pipe=augment_pipe, img_vae=img_vae,
+                               latent_scale_factor=latent_scale_factor if train_on_latents else None,
+                               target_pixels=images_pixels if e2e_pixel_l2 else None,
+                               sigma_switch=sigma_switch)
                 training_stats.report('Loss/loss', loss)
                 loss.sum().mul(loss_scaling / batch_gpu_total / batch_mul).backward()
                 # loss.mean().mul(loss_scaling / batch_mul).backward()

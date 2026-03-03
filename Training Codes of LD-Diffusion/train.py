@@ -44,6 +44,8 @@ def parse_int_list(s):
 @click.option('--real_p',        help='Full size image ratio', metavar='INT',                       type=click.FloatRange(min=0, max=1), default=0.5, show_default=True)
 @click.option('--train_on_latents',      help='Training on latent embeddings', metavar='BOOL',      type=bool, default=False, show_default=True)
 @click.option('--progressive',      help='Training on latent embeddings', metavar='BOOL',           type=bool, default=False, show_default=True)
+@click.option('--e2e_pixel_l2',      help='Decode latent prediction and optimize pixel-space L2', metavar='BOOL', type=bool, default=False, show_default=True)
+@click.option('--sigma_switch',      help='Noise level threshold for switching latent->pixel behavior', metavar='FLOAT', type=click.FloatRange(min=0), default=0.5, show_default=True)
 
 # Main options.
 @click.option('--outdir',        help='Where to save the results', metavar='DIR',                   type=str, required=True)
@@ -108,6 +110,11 @@ def main(**kwargs):
     c.real_p = opts.real_p
     c.train_on_latents = opts.train_on_latents
     c.progressive = opts.progressive
+    c.e2e_pixel_l2 = opts.e2e_pixel_l2
+    c.sigma_switch = opts.sigma_switch
+
+    if c.e2e_pixel_l2 and not c.train_on_latents:
+        raise click.ClickException('--e2e_pixel_l2=True requires --train_on_latents=True')
 
     # Validate dataset options.
     try:

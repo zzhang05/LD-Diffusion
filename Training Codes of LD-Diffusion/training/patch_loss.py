@@ -157,61 +157,83 @@ class Patch_EDMLoss:
             return DiffAugment(images,policy='translation')
         else:            
             return images
-    def pachify(self, images, patch_size, padding=None):
+    def patchify_with_coords(self, images, patch_size, i=None, j=None, apply_aug=True):
         device = images.device
-        batch_size, resolution = images.size(0), images.size(2)
-        p = 0.1
-        images = self.adaptive_fixed_augmentation(images, p)
+        batch_size, h, w = images.size(0), images.size(2), images.size(3)
 
-        if padding is not None:
-            padded = torch.zeros((images.size(0), images.size(1), images.size(2) + padding * 2,
-                                  images.size(3) + padding * 2), dtype=images.dtype, device=device)
-            padded[:, :, padding:-padding, padding:-padding] = images
-        else:
-            padded = images
+        if apply_aug:
+            images = self.adaptive_fixed_augmentation(images, p=0.1)
 
-        h, w = padded.size(2), padded.size(3)
         th, tw = patch_size, patch_size
-        s = resolution // 16
-        if w == tw and h == th:
-            i = torch.zeros((batch_size,), device=device).long()
-            j = torch.zeros((batch_size,), device=device).long()
-        else:
-            i = torch.randint(0, h - th + 1, (batch_size,), device=device)
-            j = torch.randint(0, w - tw + 1, (batch_size,), device=device)
+        if i is None or j is None:
+            if w == tw and h == th:
+                i = torch.zeros((batch_size,), device=device).long()
+                j = torch.zeros((batch_size,), device=device).long()
+            else:
+                i = torch.randint(0, h - th + 1, (batch_size,), device=device)
+                j = torch.randint(0, w - tw + 1, (batch_size,), device=device)
 
         rows = torch.arange(th, dtype=torch.long, device=device) + i[:, None]
-        columns = torch.arange(tw, dtype=torch.long, device=device) + j[:, None]
-        padded = padded.permute(1, 0, 2, 3)
-        padded = padded[:, torch.arange(batch_size)[:, None, None], rows[:, torch.arange(th)[:, None]],
-                 columns[:, None]]
-        padded = padded.permute(1, 0, 2, 3)
+        cols = torch.arange(tw, dtype=torch.long, device=device) + j[:, None]
+        images_t = images.permute(1, 0, 2, 3)
+        patch = images_t[:, torch.arange(batch_size)[:, None, None], rows[:, torch.arange(th)[:, None]], cols[:, None]]
+        patch = patch.permute(1, 0, 2, 3)
+        return patch, i, j
 
+    def latent_pos_channels(self, patch_size, resolution, i, j):
+        device = i.device
+        batch_size = i.shape[0]
+        tw = th = patch_size
         x_pos = torch.arange(tw, dtype=torch.long, device=device).unsqueeze(0).repeat(th, 1).unsqueeze(0).unsqueeze(0).repeat(batch_size, 1, 1, 1)
         y_pos = torch.arange(th, dtype=torch.long, device=device).unsqueeze(1).repeat(1, tw).unsqueeze(0).unsqueeze(0).repeat(batch_size, 1, 1, 1)
         x_pos = x_pos + j.view(-1, 1, 1, 1)
         y_pos = y_pos + i.view(-1, 1, 1, 1)
         x_pos = (x_pos / (resolution - 1) - 0.5) * 2.
         y_pos = (y_pos / (resolution - 1) - 0.5) * 2.
-        images_pos = torch.cat((x_pos, y_pos), dim=1)
+        return torch.cat((x_pos, y_pos), dim=1)
 
-        return padded, images_pos
+    def __call__(self, net, images, patch_size, resolution, labels=None, augment_pipe=None,
+                 img_vae=None, latent_scale_factor=None, target_pixels=None, sigma_switch=0.5):
+        images, i, j = self.patchify_with_coords(images, patch_size, apply_aug=True)
+        images_pos = self.latent_pos_channels(patch_size, resolution, i, j)
+        NDA_images = jigsaw_k(images, k=2)
 
-    def __call__(self, net, images, patch_size, resolution, labels=None, augment_pipe=None):
-        images, images_pos = self.pachify(images, patch_size)
-        NDA_images = jigsaw_k(images, k=2) 
         rnd_normal = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
         sigma = (rnd_normal * self.P_std + self.P_mean).exp()
         weight = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
 
-        y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)  
-        n = torch.randn_like(y) * sigma
-        yn = y + n
-
+        y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
         y1 = NDA_images
 
-        D_yn = net(yn, sigma, x_pos=images_pos, class_labels=labels, augment_labels=augment_labels)
-        loss = weight * ((D_yn - y) ** 2) + 1 / weight * 1 / (((D_yn - y1) ** 2) + 100)
+        # Hybrid latent/pixel training with explicit sigma-based switch.
+        if target_pixels is not None:
+            if img_vae is None or latent_scale_factor is None:
+                raise ValueError('target_pixels requires img_vae and latent_scale_factor')
+
+            # High-noise samples: latent-space denoising.
+            latent_noise = torch.randn_like(y) * sigma
+
+            # Low-noise samples: pixel-space noising -> encode -> latent denoising.
+            pixel_patch_size = patch_size * 8
+            target_patch, _, _ = self.patchify_with_coords(target_pixels, pixel_patch_size, i=i * 8, j=j * 8, apply_aug=False)
+            pixel_noise = torch.randn_like(target_patch) * sigma
+            y_pixel_noisy = target_patch + pixel_noise
+            y_pixel_noisy_latent = img_vae.encode(y_pixel_noisy)['latent_dist'].sample() * latent_scale_factor
+
+            sigma_mask = (sigma > sigma_switch).to(y.dtype)
+            yn = sigma_mask * (y + latent_noise) + (1 - sigma_mask) * y_pixel_noisy_latent
+
+            D_yn = net(yn, sigma, x_pos=images_pos, class_labels=labels, augment_labels=augment_labels)
+            pred_pixels = img_vae.decode(D_yn / latent_scale_factor).sample
+
+            latent_loss = weight * ((D_yn - y) ** 2) + 1 / weight * 1 / (((D_yn - y1) ** 2) + 100)
+            pixel_loss = (pred_pixels - target_patch) ** 2
+            loss = sigma_mask * latent_loss + (1 - sigma_mask) * pixel_loss
+        else:
+            n = torch.randn_like(y) * sigma
+            yn = y + n
+            D_yn = net(yn, sigma, x_pos=images_pos, class_labels=labels, augment_labels=augment_labels)
+            loss = weight * ((D_yn - y) ** 2) + 1 / weight * 1 / (((D_yn - y1) ** 2) + 100)
         return loss
 
 #----------------------------------------------------------------------------
