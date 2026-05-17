@@ -1,5 +1,4 @@
-# Official Code of Training Diffusion-based Generative Models with Limited Data (LD-Diffusion), ICML2025 
-# Advancing Diffusion Models with Limited Data via Pixel-Aware Refinement (LD-Diffusion+), submitted to TPAMI
+# Official Code of Training Diffusion-based Generative Models with Limited Data (LD-Diffusion), ICML2025 \\ Advancing Diffusion Models with Limited Data via Pixel-Aware Refinement (LD-Diffusion+), submitted to TPAMI
 
 The training and evaluation codes are released separately in the provided folders. The extended version of LD-Diffusion, i.e., LD-Diffusion+, has been submitted to TPAMI. LD-Diffusion+ consists of new theory, novel PAR module and extended experiments. 
 
