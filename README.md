@@ -4,6 +4,8 @@ The training and evaluation codes are released separately in the provided folder
 
 Feel free to contact me at zzhang55@qub.ac.uk if you have any questions.
 
+The training and evaluation codes of LD-Diffusion and PAR modules are all released! The pretrain checkpoints of LD-Diffusion and LD-Diffusion+ will be released soon.
+
 # Citation:
 
 ```
