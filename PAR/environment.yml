@@ -1,0 +1,22 @@
+name: par
+channels:
+  - pytorch
+  - nvidia
+dependencies:
+  - python>=3.8, < 3.10 
+  - pip<25
+  - numpy>=1.20
+  - click>=8.0
+  - pillow>=8.3.1
+  - scipy>=1.7.1
+  - pytorch=2.0.1
+  - psutil
+  - requests
+  - tqdm
+  - imageio
+  - pip:
+    - imageio-ffmpeg>=0.4.3
+    - xformers==0.0.22
+    - einops==0.6.0
+    - pyspng
+    - aim
